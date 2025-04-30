@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Google Maps Drone Path with Timed Capture</title>
+  <!-- Load Google Maps with Places, Drawing, and Geometry libraries -->
+  <script src="https://maps.googleapis.com/maps/api/js?key=AIzaSyBOP8d5FpYIoNV8h2Q6Rr_FG3H3cS2wWSs&libraries=places,drawing,geometry"></script>
+  <!-- Load Turf.js for spatial calculations -->
+  <script src="https://cdn.jsdelivr.net/npm/@turf/turf@6/turf.min.js"></script>
+  <style>
+    #map {
+      height: 80vh;
+      width: 70%;
+      float: left;
+    }
+    #side-panel {
+      height: 80vh;
+      width: 30%;
+      float: right;
+      padding: 10px;
+      box-sizing: border-box;
+      border-left: 1px solid #ccc;
+      overflow-y: auto;
+    }
+    #search-bar {
+      margin-bottom: 10px;
+    }
+    #preview-button {
+      margin-top: 10px;
+    }
+    #coordinates-display {
+      margin-top: 20px;
+      border-top: 1px solid #ccc;
+      padding-top: 10px;
+      font-size: 14px;
+    }
+  </style>
+</head>
+<body>
+  <div id="search-bar">
+    <input id="location-input" type="text" placeholder="Enter a location" style="width: 300px;">
+    <button onclick="searchLocation()">Search</button>
+  </div>
+  <div id="map"></div>
+  <div id="side-panel">
+    <h3>Drone Path Settings</h3>
+    <label for="altitude">Altitude (m):</label>
+    <input id="altitude" type="number" value="50" min="1"><br><br>
+
+    <label for="speed">Speed (m/s):</label>
+    <input id="speed" type="number" value="1" min="1"><br><br>
+
+    <label for="camera-angle">Camera Angle (degrees):</label>
+    <input id="camera-angle" type="number" value="45" min="0" max="90"><br><br>
+
+    <!-- Front overlap is shown for informational purposes. -->
+    <label for="front-overlap">Front Overlap (%):</label>
+    <input id="front-overlap" type="number" value="70" min="0" max="100"><br><br>
+
+    <label for="side-overlap">Side Overlap (%):</label>
+    <input id="side-overlap" type="number" value="60" min="0" max="100"><br><br>
+
+    <button id="preview-button" onclick="previewPath()">Preview Path</button><br><br>
+    <button id="serpentine-button" onclick="generateSerpentinePath()">Generate Serpentine Path</button><br><br>
+    <button id="export-button" onclick="exportPath()">Export Path</button>
+
+    <div id="coordinates-display">
+      <h4>Coordinates</h4>
+      <ul id="coordinates-list"></ul>
+    </div>
+  </div>
+
+  <script>
+    let map;
+    let drawingManager;
+    let drawnShape = null;
+    let pathMarkers = [];
+    let flightLinePolylines = [];
+    // Global variable to store generated flight lines (each as an array of waypoints)
+    window.generatedFlightLines = [];
+
+    function initMap() {
+      map = new google.maps.Map(document.getElementById("map"), {
+        center: { lat: 37.7749, lng: -122.4194 }, // Default: San Francisco
+        zoom: 13,
+      });
+
+      const input = document.getElementById("location-input");
+      const autocomplete = new google.maps.places.Autocomplete(input);
+      autocomplete.bindTo("bounds", map);
+
+      drawingManager = new google.maps.drawing.DrawingManager({
+        drawingMode: google.maps.drawing.OverlayType.POLYGON,
+        drawingControl: true,
+        drawingControlOptions: {
+          position: google.maps.ControlPosition.TOP_CENTER,
+          drawingModes: [ google.maps.drawing.OverlayType.POLYGON ]
+        },
+        polygonOptions: { editable: true, draggable: true }
+      });
+      drawingManager.setMap(map);
+
+      google.maps.event.addListener(drawingManager, 'overlaycomplete', function(event) {
+        if (drawnShape) {
+          drawnShape.setMap(null);
+          clearPathMarkers();
+          clearFlightLinePolylines();
+          clearCoordinatesDisplay();
+        }
+        drawnShape = event.overlay;
+        const pathArray = drawnShape.getPath().getArray();
+        displayCoordinatesFromPath(pathArray);
+      });
+    }
+
+    function searchLocation() {
+      const location = document.getElementById("location-input").value;
+      const geocoder = new google.maps.Geocoder();
+      geocoder.geocode({ address: location }, (results, status) => {
+        if (status === "OK") {
+          map.setCenter(results[0].geometry.location);
+          map.setZoom(15);
+        } else {
+          alert("Geocode error: " + status);
+        }
+      });
+    }
+
+    function previewPath() {
+      if (!drawnShape) {
+        alert("Please draw a boundary polygon first!");
+        return;
+      }
+      const altitude = document.getElementById("altitude").value;
+      const speed = document.getElementById("speed").value;
+      const cameraAngle = document.getElementById("camera-angle").value;
+      alert(Previewing Path:\nAltitude: ${altitude} m\nSpeed: ${speed} m/s\nCamera Angle: ${cameraAngle}°);
+    }
+
+    // Generates a serpentine flight path.
+    // Capture points along each flight line are spaced at intervals equal to the drone's speed.
+    function generateSerpentinePath() {
+      if (!drawnShape) {
+        alert("Please draw a boundary polygon first!");
+        return;
+      }
+      clearFlightLinePolylines();
+      clearCoordinatesDisplay();
+      window.generatedFlightLines = [];
+
+      // Retrieve parameters
+      const altitude = parseFloat(document.getElementById("altitude").value);
+      const speed = parseFloat(document.getElementById("speed").value);
+      const cameraAngle = parseFloat(document.getElementById("camera-angle").value);
+      const frontOverlapDesired = parseFloat(document.getElementById("front-overlap").value) / 100;
+      const sideOverlap = parseFloat(document.getElementById("side-overlap").value) / 100;
+
+      // Compute effective image footprint (assumed square):
+      // effectiveWidth = 2 * altitude * tan(cameraAngle/2)
+      const effectiveWidth = 2 * altitude * Math.tan((cameraAngle * Math.PI / 180) / 2);
+      
+      // Compute the front capture interval.
+      // Since the drone captures an image every second, the capture interval (in meters) equals the speed.
+      const spacingFront = speed; // in meters
+      
+      // For reference, the actual front overlap achieved is:
+      const actualFrontOverlap = 1 - (spacingFront / effectiveWidth);
+      console.log("Effective Width:", effectiveWidth.toFixed(2) + " m");
+      console.log("Capture Interval (Front Spacing):", spacingFront.toFixed(2) + " m");
+      console.log("Actual Front Overlap:", (actualFrontOverlap * 100).toFixed(2) + " %");
+      
+      // Determine side spacing (distance between parallel flight lines) based on side overlap.
+      const spacingSide = effectiveWidth * (1 - sideOverlap);
+      console.log("Side Spacing:", spacingSide.toFixed(2) + " m");
+      
+      // Convert side spacing (meters) to approximate degrees latitude (for a rough conversion)
+      const metersPerDegreeLat = 111320;
+      const deltaLat = spacingSide / metersPerDegreeLat;
+
+      // Convert drawn polygon to a Turf.js polygon
+      let pathArray = drawnShape.getPath().getArray();
+      let coords = pathArray.map(point => [point.lng(), point.lat()]);
+      if (coords[0][0] !== coords[coords.length - 1][0] || coords[0][1] !== coords[coords.length - 1][1]) {
+        coords.push(coords[0]);
+      }
+      const turfPolygon = turf.polygon([coords]);
+
+      // Compute bounding box from polygon coordinates
+      let lats = coords.map(c => c[1]);
+      let lngs = coords.map(c => c[0]);
+      const minLat = Math.min(...lats);
+      const maxLat = Math.max(...lats);
+      const minLng = Math.min(...lngs);
+      const maxLng = Math.max(...lngs);
+
+      let flightRows = [];
+      let rowIndex = 0;
+      // Sweep horizontal rows through the polygon using the side spacing (deltaLat)
+      for (let lat = minLat; lat <= maxLat; lat += deltaLat) {
+        let lineCoords = [ [minLng, lat], [maxLng, lat] ];
+        const turfLine = turf.lineString(lineCoords);
+        const intersections = turf.lineIntersect(turfLine, turfPolygon);
+        if (intersections.features.length >= 2) {
+          // Sort intersection points by longitude
+          const sortedPoints = intersections.features.sort((a, b) => a.geometry.coordinates[0] - b.geometry.coordinates[0]);
+          let startPoint = sortedPoints[0].geometry.coordinates;
+          let endPoint = sortedPoints[sortedPoints.length - 1].geometry.coordinates;
+          let startLatLng = new google.maps.LatLng(startPoint[1], startPoint[0]);
+          let endLatLng = new google.maps.LatLng(endPoint[1], endPoint[0]);
+          const distance = google.maps.geometry.spherical.computeDistanceBetween(startLatLng, endLatLng);
+          const heading = google.maps.geometry.spherical.computeHeading(startLatLng, endLatLng);
+          
+          // Determine number of capture points along the row based on spacingFront (which equals the speed)
+          const numWaypoints = Math.floor(distance / spacingFront) + 1;
+          let flightLineWaypoints = [];
+          for (let i = 0; i < numWaypoints; i++) {
+            const offsetDistance = i * spacingFront;
+            const waypoint = google.maps.geometry.spherical.computeOffset(startLatLng, offsetDistance, heading);
+            flightLineWaypoints.push({ lat: waypoint.lat(), lng: waypoint.lng() });
+          }
+          // Optionally, add the endpoint if needed
+          if (flightLineWaypoints.length > 0) {
+            const lastPoint = flightLineWaypoints[flightLineWaypoints.length - 1];
+            const lastLatLng = new google.maps.LatLng(lastPoint.lat, lastPoint.lng);
+            const remainingDistance = google.maps.geometry.spherical.computeDistanceBetween(lastLatLng, endLatLng);
+            if (remainingDistance > spacingFront * 0.5) {
+              flightLineWaypoints.push({ lat: endLatLng.lat(), lng: endLatLng.lng() });
+            }
+          }
+          // Reverse every alternate row for a continuous serpentine pattern
+          if (rowIndex % 2 !== 0) {
+            flightLineWaypoints.reverse();
+          }
+          flightRows.push(flightLineWaypoints);
+          rowIndex++;
+        }
+      }
+
+      // Draw each flight row on the map and display coordinates in the side panel.
+      flightRows.forEach(row => {
+        let polyline = new google.maps.Polyline({
+          path: row,
+          geodesic: true,
+          strokeColor: "#FF0000",
+          strokeOpacity: 1.0,
+          strokeWeight: 2,
+          map: map,
+        });
+        flightLinePolylines.push(polyline);
+        row.forEach(pt => addCoordinateToList(pt));
+        window.generatedFlightLines.push(row);
+      });
+    }
+
+    function exportPath() {
+      let exportData = {};
+      if (window.generatedFlightLines && window.generatedFlightLines.length > 0) {
+        exportData = {
+          flightLines: window.generatedFlightLines,
+          altitude: document.getElementById("altitude").value,
+          speed: document.getElementById("speed").value,
+          cameraAngle: document.getElementById("camera-angle").value,
+          frontOverlap: document.getElementById("front-overlap").value,
+          sideOverlap: document.getElementById("side-overlap").value,
+        };
+      } else if (drawnShape) {
+        const path = drawnShape.getPath().getArray().map(latLng => ({ lat: latLng.lat(), lng: latLng.lng() }));
+        exportData = {
+          polygon: path,
+          altitude: document.getElementById("altitude").value,
+          speed: document.getElementById("speed").value,
+          cameraAngle: document.getElementById("camera-angle").value,
+          frontOverlap: document.getElementById("front-overlap").value,
+          sideOverlap: document.getElementById("side-overlap").value,
+        };
+      } else {
+        alert("No path to export!");
+        return;
+      }
+      const blob = new Blob([JSON.stringify(exportData, null, 2)], { type: "application/json" });
+      const link = document.createElement("a");
+      link.href = URL.createObjectURL(blob);
+      link.download = "drone_path.json";
+      link.click();
+      alert("Path exported successfully!");
+    }
+
+    function addCoordinateToList(point) {
+      const coordinatesList = document.getElementById("coordinates-list");
+      const listItem = document.createElement("li");
+      listItem.textContent = Lat: ${point.lat.toFixed(6)}, Lng: ${point.lng.toFixed(6)};
+      coordinatesList.appendChild(listItem);
+    }
+
+    function displayCoordinatesFromPath(pathArray) {
+      clearCoordinatesDisplay();
+      pathArray.forEach(point => {
+        const listItem = document.createElement("li");
+        listItem.textContent = Lat: ${point.lat().toFixed(6)}, Lng: ${point.lng().toFixed(6)};
+        document.getElementById("coordinates-list").appendChild(listItem);
+      });
+    }
+
+    function clearPathMarkers() {
+      pathMarkers.forEach(marker => marker.setMap(null));
+      pathMarkers = [];
+    }
+
+    function clearFlightLinePolylines() {
+      flightLinePolylines.forEach(polyline => polyline.setMap(null));
+      flightLinePolylines = [];
+    }
+
+    function clearCoordinatesDisplay() {
+      const coordinatesList = document.getElementById("coordinates-list");
+      while (coordinatesList.firstChild) {
+        coordinatesList.removeChild(coordinatesList.firstChild);
+      }
+    }
+
+    window.onload = initMap;
+  </script>
+</body>
+</html>
